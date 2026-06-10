@@ -4,6 +4,20 @@ from datetime import datetime
 from sqlalchemy import text
 from db import AsyncSessionLocal
 from core.base import BaseExporter
+from core.columns import (
+    SALON_HEAD_PASSBOOK_HEADERS,
+    get_lower_selected_set,
+    passbook_needs_recorded_head,
+    passbook_needs_salon_base,
+    passbook_needs_growth_manager,
+    passbook_needs_current_head,
+    passbook_needs_current_wallet,
+    passbook_needs_customer_base,
+    passbook_needs_customer_state,
+    passbook_needs_payment_base,
+    passbook_needs_rzp_offers,
+    passbook_needs_luzo_offer_code
+)
 
 class SalonHeadPassbookExporter(BaseExporter):
     @classmethod
@@ -32,147 +46,168 @@ class SalonHeadPassbookExporter(BaseExporter):
 
         where_clause = " AND ".join(filters) if filters else "1=1"
 
+        # Determine requested columns
+        selected_columns = payload.get("selectedColumns")
+        req = get_lower_selected_set(selected_columns)
+
+        # Essential main table fields required for calculations and filter logic:
+        select_fields = [
+            "shp.id",
+            "shp.transaction_type",
+            "shp.deleted_at",
+            "shp.remark",
+            "shp.salon_head_wallet_id",
+            "shp.margin_used",
+            "shp.commission_percentage",
+            "shp.amount",
+            "shp.final_amount",
+            "shp.rzp_fees",
+            "shp.pnl"
+        ]
+
+        # Conditionally add other shp columns depending on column selection
+        if not selected_columns or "recorded head id" in req:
+            select_fields.append("shp.salon_head_id")
+        if not selected_columns or "salon id" in req:
+            select_fields.append("shp.salon_id")
+        if not selected_columns or "customer id" in req:
+            select_fields.append("shp.customer_id")
+        if not selected_columns or "gc amt used" in req:
+            select_fields.append("shp.gc_amt_used")
+        if not selected_columns or "platform fees" in req:
+            select_fields.append("shp.convenience_fees")
+        if not selected_columns or "cancellation fees" in req:
+            select_fields.append("shp.penalty_amt")
+        if not selected_columns or "amount before pg offers" in req:
+            select_fields.append("shp.amt_before_pg_offers")
+        if not selected_columns or "customer payment no" in req:
+            select_fields.append("shp.customer_payment_no")
+        if not selected_columns or "txn date" in req:
+            select_fields.append("DATE_FORMAT(shp.txn_date, '%d-%m-%Y') AS txn_date_formatted")
+        if not selected_columns or "txn day" in req:
+            select_fields.append("DAYNAME(shp.txn_date) AS txn_day")
+        if not selected_columns or "txn month" in req:
+            select_fields.append("DATE_FORMAT(shp.txn_date, '%b') AS txn_month")
+        if not selected_columns or "txn year" in req:
+            select_fields.append("DATE_FORMAT(shp.txn_date, '%Y') AS txn_year")
+        if not selected_columns or "rzp id" in req:
+            select_fields.append("shp.rzp_payment_id")
+        if not selected_columns or "payment id" in req:
+            select_fields.append("shp.salonsurf_pro_payment_id")
+        if not selected_columns or "referral/marketing codes used" in req:
+            select_fields.append("shp.referral_codes_used")
+        if not selected_columns or "commission sent" in req:
+            select_fields.append("shp.commission_amt_sent")
+        if not selected_columns or "commission received" in req:
+            select_fields.append("shp.commission_amt_received")
+        if not selected_columns or "deposit id" in req:
+            select_fields.append("shp.deposit_id")
+        if not selected_columns or "razorpay utr" in req:
+            select_fields.append("shp.utr")
+        if not selected_columns or "cashback used" in req:
+            select_fields.append("shp.cashback_used")
+        if not selected_columns or "cashback earned" in req:
+            select_fields.append("shp.cashback_earned")
+
+        joins = []
+
+        # salon_heads sh join
+        need_sh = passbook_needs_recorded_head(req, selected_columns)
+        if need_sh:
+            select_fields.extend([
+                "sh.title AS recorded_head_title",
+                "sh.scheme AS recorded_head_scheme",
+                "sh.settlement_type AS recorded_head_settlement_type",
+                "sh.balance_poc_at_luzo AS recorded_head_poc"
+            ])
+            joins.append("LEFT JOIN salon_heads sh ON sh.id = shp.salon_head_id")
+
+        # salons s join (and regional manager, current_head, current_wallet depend on it)
+        need_rm = passbook_needs_growth_manager(req, selected_columns)
+        need_curr_sh = passbook_needs_current_head(req, selected_columns)
+        need_curr_wallet = passbook_needs_current_wallet(req, selected_columns)
+
+        need_s = passbook_needs_salon_base(req, selected_columns) or need_rm or need_curr_sh or need_curr_wallet
+
+        if need_s:
+            select_fields.extend([
+                "s.salon_name",
+                "s.salon_location",
+                "s.city",
+                "s.salon_area",
+                "s.pincode AS salon_pincode",
+                "s.is_disabled AS salon_is_disabled"
+            ])
+            joins.append("LEFT JOIN salons s ON s.id = shp.salon_id")
+
+            if need_rm:
+                select_fields.append("(SELECT u.name FROM users u JOIN rm_salon rms ON rms.rm_id = u.id WHERE rms.salon_id = s.id LIMIT 1) AS regional_manager_name")
+            if need_curr_sh:
+                select_fields.extend([
+                    "curr_sh.id AS current_head_id",
+                    "curr_sh.title AS current_head_title",
+                    "curr_sh.scheme AS current_head_scheme",
+                    "curr_sh.settlement_type AS current_head_settlement_type",
+                    "curr_sh.balance_poc_at_luzo AS current_head_poc"
+                ])
+                joins.append("LEFT JOIN salon_heads curr_sh ON curr_sh.id = s.salon_head_id")
+            if need_curr_wallet:
+                select_fields.append("(SELECT GROUP_CONCAT(shw.id SEPARATOR '_') FROM salon_head_wallets shw WHERE shw.salon_head_id = s.salon_head_id AND shw.is_archived = 0) AS current_wallet_ids")
+
+        # customers c join
+        need_st = passbook_needs_customer_state(req, selected_columns)
+        need_c = passbook_needs_customer_base(req, selected_columns) or need_st
+
+        if need_c:
+            select_fields.extend([
+                "c.name AS customer_name",
+                "c.contact AS customer_contact",
+                "c.email AS customer_email",
+                "c.gender AS customer_gender",
+                "c.dob AS customer_dob",
+                "TIMESTAMPDIFF(YEAR, c.dob, CURDATE()) AS customer_age",
+                "c.app_version AS customer_app_version",
+                "c.os AS customer_os",
+                "c.pincode AS customer_pincode"
+            ])
+            joins.append("LEFT JOIN customers c ON c.id = shp.customer_id")
+
+            if need_st:
+                select_fields.append("st.name AS customer_state")
+                joins.append("LEFT JOIN state st ON st.id = c.state_id")
+
+        # salonsurf_pro_payments spp join
+        need_rzp_offers = passbook_needs_rzp_offers(req, selected_columns)
+        need_lou = passbook_needs_luzo_offer_code(req, selected_columns)
+        need_spp = passbook_needs_payment_base(req, selected_columns) or need_rzp_offers or need_lou
+
+        if need_spp:
+            select_fields.extend([
+                "spp.discount_percentage",
+                "spp.cashback_percentage"
+            ])
+            joins.append("LEFT JOIN salonsurf_pro_payments spp ON spp.id = shp.salonsurf_pro_payment_id")
+
+            if need_rzp_offers:
+                select_fields.append("(SELECT GROUP_CONCAT(pgo.offer_id SEPARATOR ',') FROM payment_gateway_offers_used pgo WHERE pgo.payment_id = spp.payment_id) AS rzp_offers_used")
+            if need_lou:
+                select_fields.append("lou.luzo_offer_code")
+                joins.append("LEFT JOIN luzo_offers_usages lou ON lou.salonsurf_pro_payment_id = spp.id")
+
+        select_clause = ",\n                ".join(select_fields)
+        joins_clause = "\n            ".join(joins)
+
         # SQL query fetching passbook records with joined descriptions
         query = text(f"""
             SELECT 
-                shp.id,
-                shp.salon_head_id,
-                shp.salon_head_wallet_id,
-                shp.salon_id,
-                shp.customer_id,
-                shp.transaction_type,
-                shp.amount,
-                shp.gc_amt_used,
-                shp.convenience_fees,
-                shp.penalty_amt,
-                shp.amt_before_pg_offers,
-                shp.final_amount,
-                shp.cashback_used,
-                shp.cashback_earned,
-                shp.customer_payment_no,
-                DATE_FORMAT(shp.txn_date, '%d-%m-%Y') AS txn_date_formatted,
-                DAYNAME(shp.txn_date) AS txn_day,
-                DATE_FORMAT(shp.txn_date, '%b') AS txn_month,
-                DATE_FORMAT(shp.txn_date, '%Y') AS txn_year,
-                shp.rzp_payment_id,
-                shp.salonsurf_pro_payment_id,
-                shp.referral_codes_used,
-                shp.commission_amt_sent,
-                shp.commission_amt_received,
-                shp.deposit_id,
-                shp.utr,
-                shp.deleted_at,
-                shp.remark,
-                shp.commission_percentage,
-                shp.margin_used,
-                shp.pnl,
-                shp.rzp_fees,
-                sh.title AS recorded_head_title,
-                sh.scheme AS recorded_head_scheme,
-                sh.settlement_type AS recorded_head_settlement_type,
-                sh.balance_poc_at_luzo AS recorded_head_poc,
-                s.salon_name,
-                s.salon_location,
-                s.city,
-                (SELECT u.name FROM users u JOIN rm_salon rms ON rms.rm_id = u.id WHERE rms.salon_id = s.id LIMIT 1) AS regional_manager_name,
-                curr_sh.id AS current_head_id,
-                curr_sh.title AS current_head_title,
-                curr_sh.scheme AS current_head_scheme,
-                curr_sh.settlement_type AS current_head_settlement_type,
-                curr_sh.balance_poc_at_luzo AS current_head_poc,
-                (SELECT GROUP_CONCAT(shw.id SEPARATOR '_') FROM salon_head_wallets shw WHERE shw.salon_head_id = s.salon_head_id AND shw.is_archived = 0) AS current_wallet_ids,
-                c.name AS customer_name,
-                c.contact AS customer_contact,
-                c.email AS customer_email,
-                c.gender AS customer_gender,
-                c.dob AS customer_dob,
-                TIMESTAMPDIFF(YEAR, c.dob, CURDATE()) AS customer_age,
-                c.app_version AS customer_app_version,
-                c.os AS customer_os,
-                c.pincode AS customer_pincode,
-                st.name AS customer_state,
-                s.salon_area,
-                s.pincode AS salon_pincode,
-                s.is_disabled AS salon_is_disabled,
-                (SELECT GROUP_CONCAT(pgo.offer_id SEPARATOR ',') FROM payment_gateway_offers_used pgo WHERE pgo.payment_id = spp.payment_id) AS rzp_offers_used,
-                spp.discount_percentage,
-                spp.cashback_percentage,
-                lou.luzo_offer_code
+                {select_clause}
             FROM salon_head_passbooks shp
-            LEFT JOIN salon_heads sh ON sh.id = shp.salon_head_id
-            LEFT JOIN salons s ON s.id = shp.salon_id
-            LEFT JOIN salon_heads curr_sh ON curr_sh.id = s.salon_head_id
-            LEFT JOIN customers c ON c.id = shp.customer_id
-            LEFT JOIN state st ON st.id = c.state_id
-            LEFT JOIN salonsurf_pro_payments spp ON spp.id = shp.salonsurf_pro_payment_id
-            LEFT JOIN luzo_offers_usages lou ON lou.salonsurf_pro_payment_id = spp.id
+            {joins_clause}
             WHERE {where_clause}
             ORDER BY shp.id ASC
         """)
 
-        headers = [
-            "Txn Type",
-            "Recorded Head Id",
-            "Recorded Head Name",
-            "Recorded Head Scheme",
-            "Recorded Head Settlement Type",
-            "Recorded Head POC",
-            "Recorded Head Wallet Id",
-            "Salon Id",
-            "Salon Name",
-            "Salon Location",
-            "Salon City",
-            "Growth Manager",
-            "Current Head Id",
-            "Current Head Name",
-            "Current Head Scheme",
-            "Current Head Settlement Type",
-            "Current Head POC",
-            "Current Wallet Id",
-            "Customer Id",
-            "Customer Name",
-            "Contact",
-            "Bill/Deposit Amount",
-            "Cashback Used",
-            "Discount Percentage",
-            "Platform Fees",
-            "Cancellation Fees",
-            "GC Amt Used",
-            "Amount Before PG Offers",
-            "Final Amt",
-            "Cashback Percentage",
-            "Cashback Earned",
-            "Offer Code",
-            "RZP Offers Used",
-            "RZP Fees",
-            "PNL",
-            "Gross Margin",
-            "Margin/Commission %",
-            "Customer Payment No",
-            "Txn Date",
-            "Txn Day",
-            "Txn Month",
-            "Txn Year",
-            "RZP Id",
-            "Payment Id",
-            "Referral/Marketing codes used",
-            "Commission Sent",
-            "Commission Received",
-            "Deposit Id",
-            "Customer Email",
-            "Customer Gender",
-            "Customer DOB",
-            "Customer Age",
-            "Customer App Version",
-            "Customer OS",
-            "Customer Pincode",
-            "Customer State",
-            "Salon Area",
-            "Salon Pincode",
-            "Salon Disabled",
-            "Passbook Id (Used for reconciliation)",
-            "Razorpay UTR"
-        ]
+        headers = SALON_HEAD_PASSBOOK_HEADERS
 
         async with AsyncSessionLocal() as session:
             conn = await session.connection()
@@ -207,7 +242,7 @@ class SalonHeadPassbookExporter(BaseExporter):
             # Execute streaming passbook query
             result_stream = await conn.stream(query, params)
 
-            writer = csv.writer(output_file)
+            writer = cls.get_csv_writer(output_file, headers, **kwargs)
             writer.writerow(headers)
 
             gc.disable()
@@ -267,73 +302,73 @@ class SalonHeadPassbookExporter(BaseExporter):
                             gross_margin = round(((pnl / float(row.final_amount)) * 100.0), 2)
 
                         # Format gender
-                        gender = row.customer_gender
+                        gender = getattr(row, "customer_gender", None)
                         if gender:
                             gender = gender.lower()
 
                         # Append clean row array
                         rows_to_write.append([
                             txn_label,
-                            row.salon_head_id,
-                            row.recorded_head_title or "",
-                            row.recorded_head_scheme or "",
-                            row.recorded_head_settlement_type or "",
-                            row.recorded_head_poc or "",
+                            getattr(row, "salon_head_id", None),
+                            getattr(row, "recorded_head_title", None) or "",
+                            getattr(row, "recorded_head_scheme", None) or "",
+                            getattr(row, "recorded_head_settlement_type", None) or "",
+                            getattr(row, "recorded_head_poc", None) or "",
                             row.salon_head_wallet_id,
-                            row.salon_id or "",
-                            row.salon_name or "",
-                            row.salon_location or "",
-                            row.city or "",
-                            row.regional_manager_name or "",
-                            row.current_head_id or "",
-                            row.current_head_title or "",
-                            row.current_head_scheme or "",
-                            row.current_head_settlement_type or "",
-                            row.current_head_poc or "",
-                            row.current_wallet_ids or "",
-                            row.customer_id or "",
-                            row.customer_name or "",
-                            row.customer_contact or "",
+                            getattr(row, "salon_id", None) or "",
+                            getattr(row, "salon_name", None) or "",
+                            getattr(row, "salon_location", None) or "",
+                            getattr(row, "city", None) or "",
+                            getattr(row, "regional_manager_name", None) or "",
+                            getattr(row, "current_head_id", None) or "",
+                            getattr(row, "current_head_title", None) or "",
+                            getattr(row, "current_head_scheme", None) or "",
+                            getattr(row, "current_head_settlement_type", None) or "",
+                            getattr(row, "current_head_poc", None) or "",
+                            getattr(row, "current_wallet_ids", None) or "",
+                            getattr(row, "customer_id", None) or "",
+                            getattr(row, "customer_name", None) or "",
+                            getattr(row, "customer_contact", None) or "",
                             row.amount or 0.0,
-                            row.cashback_used or 0.0,
-                            row.discount_percentage or 0.0,
-                            row.convenience_fees or 0.0,
-                            row.penalty_amt or 0.0,
-                            row.gc_amt_used or 0.0,
-                            row.amt_before_pg_offers or "",
+                            getattr(row, "cashback_used", None) or 0.0,
+                            getattr(row, "discount_percentage", None) or 0.0,
+                            getattr(row, "convenience_fees", None) or 0.0,
+                            getattr(row, "penalty_amt", None) or 0.0,
+                            getattr(row, "gc_amt_used", None) or 0.0,
+                            getattr(row, "amt_before_pg_offers", None) or "",
                             row.final_amount or 0.0,
-                            row.cashback_percentage or 0.0,
-                            row.cashback_earned or 0.0,
-                            row.luzo_offer_code or "",
-                            row.rzp_offers_used or "",
+                            getattr(row, "cashback_percentage", None) or 0.0,
+                            getattr(row, "cashback_earned", None) or 0.0,
+                            getattr(row, "luzo_offer_code", None) or "",
+                            getattr(row, "rzp_offers_used", None) or "",
                             rzp_fees_rupees,
                             pnl if pnl is not None else "",
                             gross_margin if gross_margin is not None else "",
                             margin_pct if margin_pct is not None else "",
-                            row.customer_payment_no or "",
-                            row.txn_date_formatted or "",
-                            row.txn_day or "",
-                            row.txn_month or "",
-                            row.txn_year or "",
-                            row.rzp_payment_id or "",
-                            row.salonsurf_pro_payment_id or "",
-                            row.referral_codes_used or "",
-                            row.commission_amt_sent or 0.0,
-                            row.commission_amt_received or 0.0,
-                            row.deposit_id or "",
-                            row.customer_email or "",
+                            getattr(row, "customer_payment_no", None) or "",
+                            getattr(row, "txn_date_formatted", None) or "",
+                            getattr(row, "txn_day", None) or "",
+                            getattr(row, "txn_month", None) or "",
+                            getattr(row, "txn_year", None) or "",
+                            getattr(row, "rzp_payment_id", None) or "",
+                            getattr(row, "salonsurf_pro_payment_id", None) or "",
+                            getattr(row, "referral_codes_used", None) or "",
+                            getattr(row, "commission_amt_sent", None) or 0.0,
+                            getattr(row, "commission_amt_received", None) or 0.0,
+                            getattr(row, "deposit_id", None) or "",
+                            getattr(row, "customer_email", None) or "",
                             gender or "",
-                            row.customer_dob or "",
-                            row.customer_age if row.customer_age is not None else "",
-                            row.customer_app_version or "",
-                            row.customer_os or "",
-                            row.customer_pincode or "",
-                            row.customer_state or "",
-                            row.salon_area or "",
-                            row.salon_pincode or "",
-                            "yes" if row.salon_is_disabled else "no",
+                            getattr(row, "customer_dob", None) or "",
+                            getattr(row, "customer_age", None) if getattr(row, "customer_age", None) is not None else "",
+                            getattr(row, "customer_app_version", None) or "",
+                            getattr(row, "customer_os", None) or "",
+                            getattr(row, "customer_pincode", None) or "",
+                            getattr(row, "customer_state", None) or "",
+                            getattr(row, "salon_area", None) or "",
+                            getattr(row, "salon_pincode", None) or "",
+                            "yes" if getattr(row, "salon_is_disabled", None) else "no",
                             row.id,
-                            row.utr or ""
+                            getattr(row, "utr", None) or ""
                         ])
                     writer.writerows(rows_to_write)
                     processed_count += len(partition)

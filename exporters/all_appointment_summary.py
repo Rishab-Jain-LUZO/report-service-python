@@ -94,6 +94,6 @@ class AppointmentSummaryExporter(BaseExporter):
         ]
 
         # Write calculations output directly into the S3/ZIP stream writer
-        writer = csv.writer(output_file)
+        writer = cls.get_csv_writer(output_file, headers, **kwargs)
         writer.writerow(headers)
         writer.writerow(row_data)
