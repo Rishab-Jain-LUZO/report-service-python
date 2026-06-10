@@ -77,6 +77,7 @@ MAIL_FROM_NAME="Luzo Reports"
 
 ### 4. Running the Application
 
+#### Option A: Local Manual Run
 * **Start the FastAPI Dev Server**:
   ```bash
   uvicorn main:app --host 127.0.0.1 --port 8000 --reload
@@ -91,6 +92,17 @@ MAIL_FROM_NAME="Luzo Reports"
     ```bash
     celery -A tasks.celery_app worker --loglevel=info
     ```
+
+#### Option B: Docker Containers (Recommended & Simplest Setup)
+Using Docker is recommended as it packages Python, Redis, and all library packages automatically without needing individual system installs.
+
+1. Ensure **Docker Desktop** is running.
+2. Execute the following command in the repository root:
+   ```bash
+   docker-compose up --build
+   ```
+
+*This will automatically pull Redis, build the FastAPI app container, install requirements, and run both the API server and the Celery worker in parallel.*
 
 ---
 
